@@ -34,6 +34,7 @@ The implementations are based on the following publications:
 
 import logging
 
+import torch
 import numpy as np
 import scipy
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -41,6 +42,8 @@ from sklearn.utils import assert_all_finite
 from sklearn.exceptions import NotFittedError
 from mpi4py import MPI
 import sys
+
+print("My brainiak/funcalign/srm.py is being used.")
 
 __all__ = [
     "DetSRM",
@@ -56,8 +59,7 @@ def _init_w_transforms(data, features, random_states, comm=MPI.COMM_SELF):
 
     Parameters
     ----------
-
-    data : list of 2D arrays, element i has shape=[voxels_i, samples]
+    data : list of 2D PyTorch tensors, element i has shape=[voxels_i, samples]
         Each element in the list contains the fMRI data of one subject.
 
     features : int
@@ -71,14 +73,12 @@ def _init_w_transforms(data, features, random_states, comm=MPI.COMM_SELF):
 
     Returns
     -------
-
-    w : list of array, element i has shape=[voxels_i, features]
+    w : list of torch.Tensor, element i has shape=[voxels_i, features]
         The initialized orthogonal transforms (mappings) :math:`W_i` for each
         subject.
 
-    voxels : list of int
-        A list with the number of voxels per subject.
-
+    voxels : torch.Tensor, shape=[subjects]
+        A tensor with the number of voxels per subject.
 
     Note
     ----
@@ -90,20 +90,25 @@ def _init_w_transforms(data, features, random_states, comm=MPI.COMM_SELF):
     """
     w = []
     subjects = len(data)
-    voxels = np.empty(subjects, dtype=int)
+    device = data[0].device  # Assume all data is on the same device
+    voxels = torch.empty(subjects, dtype=torch.int32, device=device)
 
     # Set Wi to a random orthogonal voxels by features matrix
     for subject in range(subjects):
         if data[subject] is not None:
             voxels[subject] = data[subject].shape[0]
-            rnd_matrix = random_states[subject].random_sample((
-                voxels[subject], features))
-            q, r = np.linalg.qr(rnd_matrix)
+            rnd_matrix = torch.tensor(
+                random_states[subject].random_sample((voxels[subject], features)),
+                dtype=torch.float32,
+                device=device
+            )
+            q, r = torch.linalg.qr(rnd_matrix)
             w.append(q)
         else:
             voxels[subject] = 0
             w.append(None)
-    voxels = comm.allreduce(voxels, op=MPI.SUM)
+    voxels = comm.allreduce(voxels.cpu().numpy(), op=MPI.SUM)
+    voxels = torch.tensor(voxels, device=device)  # Move back to the original device
     return w, voxels
 
 
@@ -216,7 +221,7 @@ class SRM(BaseEstimator, TransformerMixin):
         return
 
     def fit(self, X, y=None):
-        """Compute the probabilistic Shared Response Model
+        """Compute the probabilistic Shared Response Model using PyTorch for GPU acceleration.
 
         Parameters
         ----------
@@ -225,7 +230,11 @@ class SRM(BaseEstimator, TransformerMixin):
 
         y : not used
         """
-        logger.info('Starting Probabilistic SRM')
+        logger.info('Starting Probabilistic SRM with GPU support')
+
+        # Convert input data to PyTorch tensors and move to GPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        X = [x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32, device=device) for x in X]
 
         # Check the number of subjects
         if len(X) <= 1:
@@ -241,20 +250,19 @@ class SRM(BaseEstimator, TransformerMixin):
                     "Not all ranks have same number of subjects")
 
         # Collect size information
-        shape0 = np.zeros((number_subjects,), dtype=int)
-        shape1 = np.zeros((number_subjects,), dtype=int)
+        shape0 = torch.zeros((number_subjects,), dtype=torch.int32, device=device)
+        shape1 = torch.zeros((number_subjects,), dtype=torch.int32, device=device)
 
         for subject in range(number_subjects):
             if X[subject] is not None:
-                assert_all_finite(X[subject])
                 shape0[subject] = X[subject].shape[0]
                 shape1[subject] = X[subject].shape[1]
 
-        shape0 = self.comm.allreduce(shape0, op=MPI.SUM)
-        shape1 = self.comm.allreduce(shape1, op=MPI.SUM)
+        shape0 = self.comm.allreduce(shape0.cpu().numpy(), op=MPI.SUM)
+        shape1 = self.comm.allreduce(shape1.cpu().numpy(), op=MPI.SUM)
 
         # Check if all subjects have same number of TRs
-        number_trs = np.min(shape1)
+        number_trs = torch.min(torch.tensor(shape1, device=device))
         for subject in range(number_subjects):
             if shape1[subject] < self.features:
                 raise ValueError(
@@ -264,7 +272,7 @@ class SRM(BaseEstimator, TransformerMixin):
                 raise ValueError("Different number of samples between subjects"
                                  ".")
         # Run SRM
-        self.sigma_s_, self.w_, self.mu_, self.rho2_, self.s_ = self._srm(X)
+        self.sigma_s_, self.w_, self.mu_, self.rho2_, self.s_ = self._srm(X, device)
 
         return self
 
@@ -307,7 +315,7 @@ class SRM(BaseEstimator, TransformerMixin):
 
         Parameters
         ----------
-        data : list of 2D arrays, element i has shape=[voxels_i, samples]
+        data : list of 2D PyTorch tensors, element i has shape=[voxels_i, samples]
             Each element in the list contains the fMRI data of one subject.
 
         subjects : int
@@ -316,30 +324,29 @@ class SRM(BaseEstimator, TransformerMixin):
 
         Returns
         -------
-        x : list of array, element i has shape=[voxels_i, samples]
+        x : list of torch.Tensor, element i has shape=[voxels_i, samples]
             Demeaned data for each subject.
 
-        mu : list of array, element i has shape=[voxels_i]
+        mu : list of torch.Tensor, element i has shape=[voxels_i]
             Voxel means over samples, per subject.
 
-        rho2 : array, shape=[subjects]
+        rho2 : torch.Tensor, shape=[subjects]
             Noise variance :math:`\\rho^2` per subject.
 
-        trace_xtx : array, shape=[subjects]
+        trace_xtx : torch.Tensor, shape=[subjects]
             The squared Frobenius norm of the demeaned data in `x`.
         """
         x = []
         mu = []
-        rho2 = np.zeros(subjects)
-
-        trace_xtx = np.zeros(subjects)
+        rho2 = torch.ones(subjects, device=data[0].device)
+        trace_xtx = torch.zeros(subjects, device=data[0].device)
 
         for subject in range(subjects):
-            rho2[subject] = 1
             if data[subject] is not None:
-                mu.append(np.mean(data[subject], 1))
-                trace_xtx[subject] = np.sum(data[subject] ** 2)
-                x.append(data[subject] - mu[subject][:, np.newaxis])
+                mu_subject = torch.mean(data[subject], dim=1)
+                mu.append(mu_subject)
+                trace_xtx[subject] = torch.sum(data[subject] ** 2)
+                x.append(data[subject] - mu_subject[:, None])
             else:
                 mu.append(None)
                 trace_xtx[subject] = 0
@@ -396,27 +403,25 @@ class SRM(BaseEstimator, TransformerMixin):
 
     @staticmethod
     def _update_transform_subject(Xi, S):
-        """Updates the mappings `W_i` for one subject.
+        """Updates the mappings `W_i` for one subject using PyTorch.
 
         Parameters
         ----------
-
-        Xi : array, shape=[voxels, timepoints]
+        Xi : torch.Tensor, shape=[voxels, timepoints]
             The fMRI data :math:`X_i` for aligning the subject.
 
-        S : array, shape=[features, timepoints]
+        S : torch.Tensor, shape=[features, timepoints]
             The shared response.
 
         Returns
         -------
-
-        Wi : array, shape=[voxels, features]
+        Wi : torch.Tensor, shape=[voxels, features]
             The orthogonal transform (mapping) :math:`W_i` for the subject.
         """
-        A = Xi.dot(S.T)
-        # Solve the Procrustes problem
-        U, _, V = np.linalg.svd(A, full_matrices=False)
-        return U.dot(V)
+        A = Xi @ S.T
+        # Solve the Procrustes problem using PyTorch
+        U, _, V = torch.linalg.svd(A, full_matrices=False)
+        return U @ V
 
     def transform_subject(self, X):
         """Transform a new subject using the existing model.
@@ -480,37 +485,37 @@ class SRM(BaseEstimator, TransformerMixin):
             kwargs=np.array([self.features, self.n_iter, self.rand_seed])
         )
 
-    def _srm(self, data):
+    def _srm(self, data, device):
         """Expectation-Maximization algorithm for fitting the probabilistic
-        SRM.
+        SRM using PyTorch.
 
         Parameters
         ----------
-
-        data : list of 2D arrays, element i has shape=[voxels_i, samples]
+        data : list of 2D PyTorch tensors, element i has shape=[voxels_i, samples]
             Each element in the list contains the fMRI data of one subject.
 
+        device : torch.device
+            The device to perform computations on (GPU or CPU).
 
         Returns
         -------
-
-        sigma_s : array, shape=[features, features]
+        sigma_s : torch.Tensor, shape=[features, features]
             The covariance :math:`\\Sigma_s` of the shared response Normal
             distribution.
 
-        w : list of array, element i has shape=[voxels_i, features]
+        w : list of torch.Tensor, element i has shape=[voxels_i, features]
             The orthogonal transforms (mappings) :math:`W_i` for each subject.
 
-        mu : list of array, element i has shape=[voxels_i]
+        mu : list of torch.Tensor, element i has shape=[voxels_i]
             The voxel means :math:`\\mu_i` over the samples for each subject.
 
-        rho2 : array, shape=[subjects]
-            The estimated noise variance :math:`\\rho_i^2` for each subject
+        rho2 : torch.Tensor, shape=[subjects]
+            The estimated noise variance :math:`\\rho_i^2` for each subject.
 
-        s : array, shape=[features, samples]
+        s : torch.Tensor, shape=[features, samples]
             The shared response.
         """
-
+        # Replace numpy operations with PyTorch equivalents
         local_min = min([d.shape[1] for d in data if d is not None],
                         default=sys.maxsize)
         samples = self.comm.allreduce(local_min, op=MPI.MIN)
@@ -527,8 +532,8 @@ class SRM(BaseEstimator, TransformerMixin):
         w, voxels = _init_w_transforms(data, self.features, random_states,
                                        self.comm)
         x, mu, rho2, trace_xtx = self._init_structures(data, subjects)
-        shared_response = np.zeros((self.features, samples))
-        sigma_s = np.identity(self.features)
+        shared_response = torch.zeros((self.features, samples), device=device)
+        sigma_s = torch.eye(self.features, device=device)
 
         rank = self.comm.Get_rank()
 
@@ -543,49 +548,40 @@ class SRM(BaseEstimator, TransformerMixin):
                 rho0 = (1 / rho2).sum()
 
                 # Invert Sigma_s using Cholesky factorization
-                (chol_sigma_s, lower_sigma_s) = scipy.linalg.cho_factor(
-                    sigma_s, check_finite=False)
-                inv_sigma_s = scipy.linalg.cho_solve(
-                    (chol_sigma_s, lower_sigma_s), np.identity(self.features),
-                    check_finite=False)
+                chol_sigma_s = torch.linalg.cholesky(sigma_s)
+                inv_sigma_s = torch.cholesky_inverse(chol_sigma_s)
 
                 # Invert (Sigma_s + rho_0 * I) using Cholesky factorization
-                sigma_s_rhos = inv_sigma_s + np.identity(self.features) * rho0
-                chol_sigma_s_rhos, lower_sigma_s_rhos = \
-                    scipy.linalg.cho_factor(sigma_s_rhos,
-                                            check_finite=False)
-                inv_sigma_s_rhos = scipy.linalg.cho_solve(
-                    (chol_sigma_s_rhos, lower_sigma_s_rhos),
-                    np.identity(self.features), check_finite=False)
+                sigma_s_rhos = inv_sigma_s + torch.eye(self.features, device=device) * rho0
+                chol_sigma_s_rhos = torch.linalg.cholesky(sigma_s_rhos)
+                inv_sigma_s_rhos = torch.cholesky_inverse(chol_sigma_s_rhos)
 
             # Compute the sum of W_i^T * rho_i^-2 * X_i, and the sum of traces
             # of X_i^T * rho_i^-2 * X_i
-            wt_invpsi_x = np.zeros((self.features, samples))
+            wt_invpsi_x = torch.zeros((self.features, samples), device=device)
             trace_xt_invsigma2_x = 0.0
             for subject in range(subjects):
                 if data[subject] is not None:
-                    wt_invpsi_x += (w[subject].T.dot(x[subject])) \
-                                   / rho2[subject]
+                    wt_invpsi_x += (w[subject].T @ x[subject]) / rho2[subject]
                     trace_xt_invsigma2_x += trace_xtx[subject] / rho2[subject]
 
-            wt_invpsi_x = self.comm.reduce(wt_invpsi_x, op=MPI.SUM)
+            wt_invpsi_x = self.comm.reduce(wt_invpsi_x.cpu().numpy(), op=MPI.SUM)
             trace_xt_invsigma2_x = self.comm.reduce(trace_xt_invsigma2_x,
                                                     op=MPI.SUM)
             trace_sigma_s = None
             if rank == 0:
-                log_det_psi = np.sum(np.log(rho2) * voxels)
+                log_det_psi = torch.sum(torch.log(rho2) * voxels)
 
                 # Update the shared response
-                shared_response = sigma_s.dot(
-                    np.identity(self.features) - rho0 * inv_sigma_s_rhos).dot(
-                    wt_invpsi_x)
+                shared_response = sigma_s @ (
+                    torch.eye(self.features, device=device) - rho0 * inv_sigma_s_rhos) @ torch.tensor(wt_invpsi_x, device=device)
 
                 # M-step
 
                 # Update Sigma_s and compute its trace
                 sigma_s = (inv_sigma_s_rhos
-                           + shared_response.dot(shared_response.T) / samples)
-                trace_sigma_s = samples * np.trace(sigma_s)
+                           + shared_response @ shared_response.T / samples)
+                trace_sigma_s = samples * torch.trace(sigma_s)
 
             shared_response = self.comm.bcast(shared_response)
             trace_sigma_s = self.comm.bcast(trace_sigma_s)
@@ -594,20 +590,21 @@ class SRM(BaseEstimator, TransformerMixin):
             # rho_i^2
             for subject in range(subjects):
                 if x[subject] is not None:
-                    a_subject = x[subject].dot(shared_response.T)
-                    perturbation = np.zeros(a_subject.shape)
-                    np.fill_diagonal(perturbation, 0.001)
-                    u_subject, s_subject, v_subject = np.linalg.svd(
+                    a_subject = x[subject] @ shared_response.T
+                    perturbation = torch.zeros_like(a_subject)
+                    torch.fill_diagonal_(perturbation, 0.001)
+                    u_subject, s_subject, v_subject = torch.linalg.svd(
                         a_subject + perturbation, full_matrices=False)
-                    w[subject] = u_subject.dot(v_subject)
+                    w[subject] = u_subject @ v_subject
                     rho2[subject] = trace_xtx[subject]
-                    rho2[subject] += -2 * np.sum(w[subject] * a_subject).sum()
+                    rho2[subject] += -2 * torch.sum(w[subject] * a_subject).sum()
                     rho2[subject] += trace_sigma_s
                     rho2[subject] /= samples * voxels[subject]
                 else:
                     rho2[subject] = 0
 
-            rho2 = self.comm.allreduce(rho2, op=MPI.SUM)
+            rho2 = self.comm.allreduce(rho2.cpu().numpy(), op=MPI.SUM)
+            rho2 = torch.tensor(rho2, device=device)
 
             if rank == 0:
                 if logger.isEnabledFor(logging.INFO):
