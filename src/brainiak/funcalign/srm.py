@@ -305,7 +305,6 @@ class SRM(BaseEstimator, TransformerMixin):
         s = [None] * len(X)
         for subject in range(len(X)):
             if X[subject] is not None:
-                # Replace .dot with @ for matrix multiplication
                 s[subject] = self.w_[subject].T @ X[subject]
 
         return s
@@ -340,6 +339,7 @@ class SRM(BaseEstimator, TransformerMixin):
         x = []
         mu = []
         rho2 = torch.ones(subjects, device=data[0].device)
+
         trace_xtx = torch.zeros(subjects, device=data[0].device)
 
         for subject in range(subjects):
@@ -408,6 +408,7 @@ class SRM(BaseEstimator, TransformerMixin):
 
         Parameters
         ----------
+
         Xi : torch.Tensor, shape=[voxels, timepoints]
             The fMRI data :math:`X_i` for aligning the subject.
 
