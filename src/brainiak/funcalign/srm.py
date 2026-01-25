@@ -233,7 +233,7 @@ class SRM(BaseEstimator, TransformerMixin):
         logger.info('Starting Probabilistic SRM with GPU support')
 
         # Convert input data to PyTorch tensors and move to GPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
         X = [x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32, device=device) for x in X]
 
         # Check the number of subjects
@@ -305,7 +305,8 @@ class SRM(BaseEstimator, TransformerMixin):
         s = [None] * len(X)
         for subject in range(len(X)):
             if X[subject] is not None:
-                s[subject] = self.w_[subject].T.dot(X[subject])
+                # Replace .dot with @ for matrix multiplication
+                s[subject] = self.w_[subject].T @ X[subject]
 
         return s
 
@@ -592,7 +593,9 @@ class SRM(BaseEstimator, TransformerMixin):
                 if x[subject] is not None:
                     a_subject = x[subject] @ shared_response.T
                     perturbation = torch.zeros_like(a_subject)
-                    torch.fill_diagonal_(perturbation, 0.001)
+                    # Replace fill_diagonal_ with manual diagonal filling
+                    diag_indices = torch.arange(min(perturbation.shape), device=device)
+                    perturbation[diag_indices, diag_indices] = 0.001
                     u_subject, s_subject, v_subject = torch.linalg.svd(
                         a_subject + perturbation, full_matrices=False)
                     w[subject] = u_subject @ v_subject
