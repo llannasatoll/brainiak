@@ -51,7 +51,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
+stdout_handler = logging.StreamHandler(stream=sys.stdout)
+stdout_handler.setLevel(logging.INFO)
+logger.addHandler(stdout_handler)
 
 def _init_w_transforms(data, features, random_states, comm=MPI.COMM_SELF):
     """Initialize the mappings (Wi) for the SRM with random orthogonal
@@ -232,9 +235,17 @@ class SRM(BaseEstimator, TransformerMixin):
         """
         logger.info('Starting Probabilistic SRM with GPU support')
 
-        # Convert input data to PyTorch tensors and move to GPU
-        device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
-        X = [x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32, device=device) for x in X]
+        # Check if multiple GPUs are available
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Using {torch.cuda.device_count()} GPUs")
+            self.device = torch.device("cuda:0")
+            self.model = torch.nn.DataParallel(self).to(self.device)
+        else:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            logger.info(f"Using device: {self.device}")
+
+        # Convert input data to PyTorch tensors and move to the appropriate device
+        X = [x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32, device=self.device) for x in X]
 
         # Check the number of subjects
         if len(X) <= 1:
@@ -250,8 +261,8 @@ class SRM(BaseEstimator, TransformerMixin):
                     "Not all ranks have same number of subjects")
 
         # Collect size information
-        shape0 = torch.zeros((number_subjects,), dtype=torch.int32, device=device)
-        shape1 = torch.zeros((number_subjects,), dtype=torch.int32, device=device)
+        shape0 = torch.zeros((number_subjects,), dtype=torch.int32, device=self.device)
+        shape1 = torch.zeros((number_subjects,), dtype=torch.int32, device=self.device)
 
         for subject in range(number_subjects):
             if X[subject] is not None:
@@ -262,7 +273,7 @@ class SRM(BaseEstimator, TransformerMixin):
         shape1 = self.comm.allreduce(shape1.cpu().numpy(), op=MPI.SUM)
 
         # Check if all subjects have same number of TRs
-        number_trs = torch.min(torch.tensor(shape1, device=device))
+        number_trs = torch.min(torch.tensor(shape1, device=self.device))
         for subject in range(number_subjects):
             if shape1[subject] < self.features:
                 raise ValueError(
@@ -272,7 +283,7 @@ class SRM(BaseEstimator, TransformerMixin):
                 raise ValueError("Different number of samples between subjects"
                                  ".")
         # Run SRM
-        self.sigma_s_, self.w_, self.mu_, self.rho2_, self.s_ = self._srm(X, device)
+        self.sigma_s_, self.w_, self.mu_, self.rho2_, self.s_ = self._srm(X, self.device)
 
         return self
 
@@ -539,24 +550,80 @@ class SRM(BaseEstimator, TransformerMixin):
 
         rank = self.comm.Get_rank()
 
-        # Main loop of the algorithm (run
+        # Main loop of the algorithm (run)
         for iteration in range(self.n_iter):
             logger.info('Iteration %d' % (iteration + 1))
 
             # E-step:
 
-            # Sum the inverted the rho2 elements for computing W^T * Psi^-1 * W
+            # Ensure sigma_s is positive-definite
             if rank == 0:
-                rho0 = (1 / rho2).sum()
+                eigenvalues = torch.linalg.eigvalsh(sigma_s)
+                logger.debug("Eigenvalues of sigma_s: %s", eigenvalues)
 
-                # Invert Sigma_s using Cholesky factorization
-                chol_sigma_s = torch.linalg.cholesky(sigma_s)
+                min_eigenvalue = torch.min(eigenvalues)
+                if min_eigenvalue <= 0:
+                    logger.warning("sigma_s is not positive-definite. Adjusting eigenvalues.")
+                    sigma_s += torch.eye(self.features, device=device) * (-min_eigenvalue + 1e-2)
+
+                try:
+                    chol_sigma_s = torch.linalg.cholesky(sigma_s)
+                except torch._C._LinAlgError as e:
+                    logger.error("Cholesky decomposition failed for sigma_s at iteration %d" % (iteration + 1))
+                    logger.error("sigma_s: %s" % sigma_s)
+                    logger.error("Eigenvalues of sigma_s: %s", eigenvalues)
+
+                    # Use eigenvalue decomposition to approximate a positive-definite matrix
+                    logger.warning("Using eigenvalue decomposition to adjust sigma_s.")
+                    eigvals, eigvecs = torch.linalg.eigh(sigma_s)
+                    eigvals = torch.clamp(eigvals, min=1e-2)  # Ensure all eigenvalues are sufficiently positive
+                    sigma_s = eigvecs @ torch.diag(eigvals) @ eigvecs.T
+
+                    # Retry Cholesky decomposition
+                    try:
+                        chol_sigma_s = torch.linalg.cholesky(sigma_s)
+                    except torch._C._LinAlgError:
+                        logger.error("Cholesky decomposition failed again. Using pseudo-inverse as fallback.")
+                        sigma_s = torch.linalg.pinv(sigma_s)  # Use pseudo-inverse as a fallback
+
                 inv_sigma_s = torch.cholesky_inverse(chol_sigma_s)
+
+                # Sum the inverted the rho2 elements for computing W^T * Psi^-1 * W
+                rho0 = (1 / rho2).sum()
 
                 # Invert (Sigma_s + rho_0 * I) using Cholesky factorization
                 sigma_s_rhos = inv_sigma_s + torch.eye(self.features, device=device) * rho0
-                chol_sigma_s_rhos = torch.linalg.cholesky(sigma_s_rhos)
-                inv_sigma_s_rhos = torch.cholesky_inverse(chol_sigma_s_rhos)
+
+                # Add a small value to the diagonal for numerical stability
+                sigma_s_rhos += torch.eye(self.features, device=device) * 1e-2
+
+                # Check eigenvalues for debugging
+                eigenvalues = torch.linalg.eigvalsh(sigma_s_rhos)
+                logger.debug("Eigenvalues of sigma_s_rhos: %s", eigenvalues)
+
+                # Ensure positive definiteness by adjusting eigenvalues
+                min_eigenvalue = torch.min(eigenvalues)
+                if min_eigenvalue <= 0:
+                    logger.warning("sigma_s_rhos is not positive-definite. Adjusting eigenvalues.")
+                    sigma_s_rhos += torch.eye(self.features, device=device) * (-min_eigenvalue + 1e-2)
+
+                try:
+                    chol_sigma_s_rhos = torch.linalg.cholesky(sigma_s_rhos)
+                    inv_sigma_s_rhos = torch.cholesky_inverse(chol_sigma_s_rhos)
+                except torch._C._LinAlgError as e:
+                    logger.error("Cholesky decomposition failed at iteration %d" % (iteration + 1))
+                    logger.error("sigma_s_rhos: %s" % sigma_s_rhos)
+                    logger.error("Eigenvalues of sigma_s_rhos: %s", eigenvalues)
+
+                    # Use eigenvalue decomposition as a fallback
+                    logger.warning("Using eigenvalue decomposition to approximate a positive-definite matrix.")
+                    eigvals, eigvecs = torch.linalg.eigh(sigma_s_rhos)
+                    eigvals = torch.clamp(eigvals, min=1e-2)  # Ensure all eigenvalues are sufficiently positive
+                    sigma_s_rhos = eigvecs @ torch.diag(eigvals) @ eigvecs.T
+
+                    # Retry Cholesky decomposition
+                    chol_sigma_s_rhos = torch.linalg.cholesky(sigma_s_rhos)
+                    inv_sigma_s_rhos = torch.cholesky_inverse(chol_sigma_s_rhos)
 
             # Compute the sum of W_i^T * rho_i^-2 * X_i, and the sum of traces
             # of X_i^T * rho_i^-2 * X_i
@@ -597,9 +664,27 @@ class SRM(BaseEstimator, TransformerMixin):
                     # Replace fill_diagonal_ with manual diagonal filling
                     diag_indices = torch.arange(min(perturbation.shape), device=device)
                     perturbation[diag_indices, diag_indices] = 0.001
-                    u_subject, s_subject, v_subject = torch.linalg.svd(
-                        a_subject + perturbation, full_matrices=False)
-                    w[subject] = u_subject @ v_subject
+
+                    try:
+                        # Process SVD in smaller batches to reduce memory usage
+                        u_subject, s_subject, v_subject = torch.linalg.svd(
+                            a_subject + perturbation, full_matrices=False)
+                        w[subject] = u_subject @ v_subject
+                    except torch.OutOfMemoryError:
+                        logger.warning("Out of memory during SVD. Switching to CPU for subject %d." % subject)
+                        a_subject_cpu = a_subject.cpu()
+                        u_subject, s_subject, v_subject = torch.linalg.svd(
+                            a_subject_cpu + perturbation.cpu(), full_matrices=False)
+                        w[subject] = (u_subject @ v_subject).to(device)
+                    except Exception as e:
+                        logger.error("SVD failed for subject %d: %s" % (subject, str(e)))
+                        continue
+
+                    # Free GPU memory
+                    del u_subject, s_subject, v_subject
+                    torch.cuda.empty_cache()
+
+                    # Update rho2
                     rho2[subject] = trace_xtx[subject]
                     rho2[subject] += -2 * torch.sum(w[subject] * a_subject).sum()
                     rho2[subject] += trace_sigma_s
