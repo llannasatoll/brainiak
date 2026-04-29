@@ -235,17 +235,22 @@ class SRM(BaseEstimator, TransformerMixin):
         """
         logger.info('Starting Probabilistic SRM with GPU support')
 
-        # Check if multiple GPUs are available
-        if torch.cuda.device_count() > 1:
-            logger.info(f"Using {torch.cuda.device_count()} GPUs")
-            self.device = torch.device("cuda:0")
-            self.model = torch.nn.DataParallel(self).to(self.device)
+        # Select one device per process (works better with MPI than DataParallel)
+        if torch.cuda.is_available():
+            n_gpus = torch.cuda.device_count()
+            rank = self.comm.Get_rank()
+            gpu_id = rank % n_gpus
+            self.device = torch.device(f"cuda:{gpu_id}")
+            torch.cuda.set_device(self.device)
+            logger.info(f"Using device: {self.device} (rank={rank}, n_gpus={n_gpus})")
         else:
-            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            logger.info(f"Using device: {self.device}")
+            self.device = torch.device("cpu")
+            logger.info("Using device: cpu")
 
-        # Convert input data to PyTorch tensors and move to the appropriate device
-        X = [x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32, device=self.device) for x in X]
+        # Convert input data to torch tensors on the selected device
+        X = [None if x is None else torch.as_tensor(
+            x, dtype=torch.float32, device=self.device
+        ) for x in X]
 
         # Check the number of subjects
         if len(X) <= 1:
@@ -261,8 +266,8 @@ class SRM(BaseEstimator, TransformerMixin):
                     "Not all ranks have same number of subjects")
 
         # Collect size information
-        shape0 = torch.zeros((number_subjects,), dtype=torch.int32, device=self.device)
-        shape1 = torch.zeros((number_subjects,), dtype=torch.int32, device=self.device)
+        shape0 = torch.zeros((number_subjects,), dtype=torch.int32, device=X[0].device)
+        shape1 = torch.zeros((number_subjects,), dtype=torch.int32, device=X[0].device)
 
         for subject in range(number_subjects):
             if X[subject] is not None:
@@ -273,7 +278,7 @@ class SRM(BaseEstimator, TransformerMixin):
         shape1 = self.comm.allreduce(shape1.cpu().numpy(), op=MPI.SUM)
 
         # Check if all subjects have same number of TRs
-        number_trs = torch.min(torch.tensor(shape1, device=self.device))
+        number_trs = torch.min(torch.tensor(shape1, device=X[0].device))
         for subject in range(number_subjects):
             if shape1[subject] < self.features:
                 raise ValueError(
@@ -404,11 +409,16 @@ class SRM(BaseEstimator, TransformerMixin):
         loglikehood : float
             The log-likelihood value.
         """
-        log_det = (np.log(np.diag(chol_sigma_s_rhos) ** 2).sum() + log_det_psi
-                   + np.log(np.diag(chol_sigma_s) ** 2).sum())
+        # Ensure tensors are on CPU before converting to numpy
+        chol_sigma_s_rhos_cpu = chol_sigma_s_rhos.cpu().numpy()
+        chol_sigma_s_cpu = chol_sigma_s.cpu().numpy()
+        inv_sigma_s_rhos_cpu = inv_sigma_s_rhos.cpu().numpy()
+
+        log_det = (np.log(np.diag(chol_sigma_s_rhos_cpu) ** 2).sum() + log_det_psi
+                   + np.log(np.diag(chol_sigma_s_cpu) ** 2).sum())
         loglikehood = -0.5 * samples * log_det - 0.5 * trace_xt_invsigma2_x
         loglikehood += 0.5 * np.trace(
-            wt_invpsi_x.T.dot(inv_sigma_s_rhos).dot(wt_invpsi_x))
+            wt_invpsi_x.T.dot(inv_sigma_s_rhos_cpu).dot(wt_invpsi_x))
         # + const --> -0.5*nTR*nvoxel*subjects*math.log(2*math.pi)
 
         return loglikehood
@@ -431,10 +441,32 @@ class SRM(BaseEstimator, TransformerMixin):
         Wi : torch.Tensor, shape=[voxels, features]
             The orthogonal transform (mapping) :math:`W_i` for the subject.
         """
+        # Memory-efficient orthogonal Procrustes for tall matrices.
+        # A = Xi S^T has shape [voxels, features] with voxels >> features.
+        # We avoid full SVD(A) and instead use eigendecomposition of A^T A.
         A = Xi @ S.T
-        # Solve the Procrustes problem using PyTorch
-        U, _, V = torch.linalg.svd(A, full_matrices=False)
-        return U @ V
+        k = A.shape[1]
+        eye_k = torch.eye(k, dtype=A.dtype, device=A.device)
+        ata = A.T @ A
+        ata = 0.5 * (ata + ata.T)
+
+        for eps in (1e-6, 1e-4, 1e-2, 1e-1):
+            try:
+                evals, evecs = torch.linalg.eigh(ata + eps * eye_k)
+                evals = torch.clamp(evals, min=eps)
+                inv_sqrt = torch.rsqrt(evals)
+                w = (A @ evecs) * inv_sqrt.unsqueeze(0)
+                w = w @ evecs.T
+                if torch.isfinite(w).all():
+                    return w
+            except (torch.OutOfMemoryError, RuntimeError):
+                continue
+
+        # Last-resort fallback on CPU SVD for numerical robustness.
+        A_cpu = A.detach().float().cpu().numpy()
+        u, _, vt = scipy.linalg.svd(A_cpu, full_matrices=False, lapack_driver='gesvd')
+        w_cpu = u @ vt
+        return torch.from_numpy(w_cpu).to(A.device, dtype=A.dtype)
 
     def transform_subject(self, X):
         """Transform a new subject using the existing model.
@@ -556,46 +588,44 @@ class SRM(BaseEstimator, TransformerMixin):
 
             # E-step:
 
-            # Ensure sigma_s is positive-definite
+            # Ensure sigma_s is positive-definite and well-conditioned
             if rank == 0:
-                eigenvalues = torch.linalg.eigvalsh(sigma_s)
-                logger.debug("Eigenvalues of sigma_s: %s", eigenvalues)
-
-                min_eigenvalue = torch.min(eigenvalues)
-                if min_eigenvalue <= 0:
-                    logger.warning("sigma_s is not positive-definite. Adjusting eigenvalues.")
-                    sigma_s += torch.eye(self.features, device=device) * (-min_eigenvalue + 1e-2)
+                # Check for NaN/Inf in sigma_s
+                if not torch.isfinite(sigma_s).all():
+                    logger.warning("sigma_s contains NaN/Inf. Reinitializing to identity.")
+                    sigma_s = torch.eye(self.features, device=device)
+                
+                try:
+                    eigenvalues = torch.linalg.eigvalsh(sigma_s)
+                    logger.debug("Eigenvalues of sigma_s: %s", eigenvalues)
+                    min_eigenvalue = torch.min(eigenvalues)
+                    if min_eigenvalue <= 0:
+                        logger.warning("sigma_s is not positive-definite. Adjusting eigenvalues.")
+                        sigma_s += torch.eye(self.features, device=device) * (-min_eigenvalue + 1e-2)
+                except torch._C._LinAlgError as e:
+                    logger.warning(f"eigsh failed on sigma_s: {e}. Using pseudo-inverse.")
+                    sigma_s = torch.linalg.pinv(sigma_s)
+                    sigma_s = 0.5 * (sigma_s + sigma_s.T)
+                    sigma_s += torch.eye(self.features, device=device) * 1e-3
 
                 try:
                     chol_sigma_s = torch.linalg.cholesky(sigma_s)
+                    inv_sigma_s = torch.cholesky_inverse(chol_sigma_s)
                 except torch._C._LinAlgError as e:
-                    logger.error("Cholesky decomposition failed for sigma_s at iteration %d" % (iteration + 1))
-                    logger.error("sigma_s: %s" % sigma_s)
-                    logger.error("Eigenvalues of sigma_s: %s", eigenvalues)
-
-                    # Use eigenvalue decomposition to approximate a positive-definite matrix
-                    logger.warning("Using eigenvalue decomposition to adjust sigma_s.")
-                    eigvals, eigvecs = torch.linalg.eigh(sigma_s)
-                    eigvals = torch.clamp(eigvals, min=1e-2)  # Ensure all eigenvalues are sufficiently positive
-                    sigma_s = eigvecs @ torch.diag(eigvals) @ eigvecs.T
-
-                    # Retry Cholesky decomposition
-                    try:
-                        chol_sigma_s = torch.linalg.cholesky(sigma_s)
-                    except torch._C._LinAlgError:
-                        logger.error("Cholesky decomposition failed again. Using pseudo-inverse as fallback.")
-                        sigma_s = torch.linalg.pinv(sigma_s)  # Use pseudo-inverse as a fallback
-
-                inv_sigma_s = torch.cholesky_inverse(chol_sigma_s)
+                    logger.warning(f"Cholesky failed for sigma_s at iter {iteration + 1}: {e}. Using pinv.")
+                    inv_sigma_s = torch.linalg.pinv(sigma_s)
 
                 # Sum the inverted the rho2 elements for computing W^T * Psi^-1 * W
-                rho0 = (1 / rho2).sum()
+                rho0 = (1 / rho2).sum().to(inv_sigma_s.device)  # Ensure rho0 is on the same device as inv_sigma_s
+
+                # Ensure all tensors are on the same device
+                eye_tensor = torch.eye(self.features, device=inv_sigma_s.device)
 
                 # Invert (Sigma_s + rho_0 * I) using Cholesky factorization
-                sigma_s_rhos = inv_sigma_s + torch.eye(self.features, device=device) * rho0
+                sigma_s_rhos = inv_sigma_s + eye_tensor * rho0
 
                 # Add a small value to the diagonal for numerical stability
-                sigma_s_rhos += torch.eye(self.features, device=device) * 1e-2
+                sigma_s_rhos += eye_tensor * 1e-2
 
                 # Check eigenvalues for debugging
                 eigenvalues = torch.linalg.eigvalsh(sigma_s_rhos)
@@ -605,25 +635,14 @@ class SRM(BaseEstimator, TransformerMixin):
                 min_eigenvalue = torch.min(eigenvalues)
                 if min_eigenvalue <= 0:
                     logger.warning("sigma_s_rhos is not positive-definite. Adjusting eigenvalues.")
-                    sigma_s_rhos += torch.eye(self.features, device=device) * (-min_eigenvalue + 1e-2)
+                    sigma_s_rhos += eye_tensor * (-min_eigenvalue + 1e-2)
 
                 try:
                     chol_sigma_s_rhos = torch.linalg.cholesky(sigma_s_rhos)
                     inv_sigma_s_rhos = torch.cholesky_inverse(chol_sigma_s_rhos)
                 except torch._C._LinAlgError as e:
-                    logger.error("Cholesky decomposition failed at iteration %d" % (iteration + 1))
-                    logger.error("sigma_s_rhos: %s" % sigma_s_rhos)
-                    logger.error("Eigenvalues of sigma_s_rhos: %s", eigenvalues)
-
-                    # Use eigenvalue decomposition as a fallback
-                    logger.warning("Using eigenvalue decomposition to approximate a positive-definite matrix.")
-                    eigvals, eigvecs = torch.linalg.eigh(sigma_s_rhos)
-                    eigvals = torch.clamp(eigvals, min=1e-2)  # Ensure all eigenvalues are sufficiently positive
-                    sigma_s_rhos = eigvecs @ torch.diag(eigvals) @ eigvecs.T
-
-                    # Retry Cholesky decomposition
-                    chol_sigma_s_rhos = torch.linalg.cholesky(sigma_s_rhos)
-                    inv_sigma_s_rhos = torch.cholesky_inverse(chol_sigma_s_rhos)
+                    logger.warning(f"Cholesky failed for sigma_s_rhos at iter {iteration + 1}: {e}. Using pinv.")
+                    inv_sigma_s_rhos = torch.linalg.pinv(sigma_s_rhos)
 
             # Compute the sum of W_i^T * rho_i^-2 * X_i, and the sum of traces
             # of X_i^T * rho_i^-2 * X_i
@@ -655,40 +674,30 @@ class SRM(BaseEstimator, TransformerMixin):
             shared_response = self.comm.bcast(shared_response)
             trace_sigma_s = self.comm.bcast(trace_sigma_s)
 
-            # Update each subject's mapping transform W_i and error variance
-            # rho_i^2
+            # Update each subject's mapping transform W_i and error variance rho_i^2
             for subject in range(subjects):
                 if x[subject] is not None:
-                    a_subject = x[subject] @ shared_response.T
-                    perturbation = torch.zeros_like(a_subject)
-                    # Replace fill_diagonal_ with manual diagonal filling
-                    diag_indices = torch.arange(min(perturbation.shape), device=device)
-                    perturbation[diag_indices, diag_indices] = 0.001
-
                     try:
-                        # Process SVD in smaller batches to reduce memory usage
-                        u_subject, s_subject, v_subject = torch.linalg.svd(
-                            a_subject + perturbation, full_matrices=False)
-                        w[subject] = u_subject @ v_subject
-                    except torch.OutOfMemoryError:
-                        logger.warning("Out of memory during SVD. Switching to CPU for subject %d." % subject)
-                        a_subject_cpu = a_subject.cpu()
-                        u_subject, s_subject, v_subject = torch.linalg.svd(
-                            a_subject_cpu + perturbation.cpu(), full_matrices=False)
-                        w[subject] = (u_subject @ v_subject).to(device)
+                        w_new = self._update_transform_subject(
+                            x[subject], shared_response
+                        )
+                        if torch.isfinite(w_new).all():
+                            w[subject] = w_new
+                        else:
+                            logger.warning(f"NaN in w update for subject {subject}. Keeping previous.")
                     except Exception as e:
-                        logger.error("SVD failed for subject %d: %s" % (subject, str(e)))
-                        continue
+                        logger.warning(f"Procrustes update failed for subject {subject}: {e}. Keeping previous.")
 
-                    # Free GPU memory
-                    del u_subject, s_subject, v_subject
-                    torch.cuda.empty_cache()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
-                    # Update rho2
-                    rho2[subject] = trace_xtx[subject]
-                    rho2[subject] += -2 * torch.sum(w[subject] * a_subject).sum()
-                    rho2[subject] += trace_sigma_s
-                    rho2[subject] /= samples * voxels[subject]
+                    # Update rho2: use stable residual norm computation
+                    residual_norm_sq = torch.sum((x[subject] - w[subject] @ shared_response) ** 2)
+                    rho2_new = residual_norm_sq / (samples * voxels[subject])
+                    if torch.isfinite(rho2_new) and rho2_new > 0:
+                        rho2[subject] = rho2_new
+                    else:
+                        logger.warning(f"Invalid rho2 for subject {subject}. Keeping previous.")
                 else:
                     rho2[subject] = 0
 
